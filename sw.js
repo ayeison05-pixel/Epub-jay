@@ -2,7 +2,7 @@
    Service Worker — Lector EPUB
    ============================================================ */
 
-const CACHE_VERSION = 'v1.0.0';
+const CACHE_VERSION = 'v1.0.1';
 const APP_CACHE = `lector-app-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `lector-runtime-${CACHE_VERSION}`;
 

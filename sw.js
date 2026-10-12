@@ -1,102 +1,166 @@
+
 /* ============================================================
    Service Worker — Lector EPUB
+   Corregido para GitHub Pages (sitio publicado en subruta).
    ============================================================ */
 
-const CACHE_VERSION = 'v1.0.2';
+const CACHE_VERSION = 'v1.0.1';
 const APP_CACHE = `lector-app-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `lector-runtime-${CACHE_VERSION}`;
+const BASE_URL = self.registration.scope;
+const INDEX_URL = new URL('./index.html', BASE_URL).href;
 
-/* Recursos del shell: se cachean en la instalación.
-   Rutas relativas para funcionar bajo subdirectorio de GitHub Pages. */
+/* Recursos locales de la aplicación */
 const APP_SHELL = [
-  './',
-  './index.html',
-  './manifest.json',
-  './icon.svg'
+  INDEX_URL,
+  new URL('./manifest.json', BASE_URL).href,
+  new URL('./icon-192.png', BASE_URL).href,
+  new URL('./icon-512.png', BASE_URL).href
 ];
 
 /* ---------- Instalación ---------- */
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(APP_CACHE)
-      .then((cache) => cache.addAll(APP_SHELL))
-      .then(() => self.skipWaiting())
-      .catch((err) => console.warn('[SW] install failed', err))
-  );
+  event.waitUntil((async () => {
+    const cache = await caches.open(APP_CACHE);
+
+    try {
+      await cache.addAll(APP_SHELL);
+      await self.skipWaiting();
+    } catch (error) {
+      console.error(
+        '[SW] No se pudo precargar el shell de la PWA.',
+        error
+      );
+      throw error;
+    }
+  })());
 });
 
-/* ---------- Activación: limpia versiones antiguas ---------- */
+/* ---------- Activación ---------- */
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys()
-      .then((keys) => Promise.all(
-        keys
-          .filter((k) => k !== APP_CACHE && k !== RUNTIME_CACHE)
-          .map((k) => caches.delete(k))
-      ))
-      .then(() => self.clients.claim())
-  );
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+
+    await Promise.all(
+      keys
+        .filter((key) =>
+          (
+            key.startsWith('lector-app-') ||
+            key.startsWith('lector-runtime-')
+          ) &&
+          key !== APP_CACHE &&
+          key !== RUNTIME_CACHE
+        )
+        .map((key) => caches.delete(key))
+    );
+
+    await self.clients.claim();
+  })());
 });
 
 /* ---------- Estrategias de fetch ---------- */
 self.addEventListener('fetch', (event) => {
-  const req = event.request;
+  const request = event.request;
 
-  // Solo GET
-  if (req.method !== 'GET') return;
+  if (request.method !== 'GET') return;
 
-  const url = new URL(req.url);
+  const url = new URL(request.url);
+  const base = new URL(BASE_URL);
 
-  // 1) Navegación (abrir la app): red primero, fallback al index cacheado
-  if (req.mode === 'navigate') {
-    event.respondWith(
-      fetch(req)
-        .then((resp) => {
-          const clone = resp.clone();
-          caches.open(APP_CACHE).then((c) => c.put('./index.html', clone));
-          return resp;
-        })
-        .catch(() => caches.match('./index.html'))
-    );
-    return;
-  }
+  /* Navegación: red primero; caché como alternativa offline */
+  if (request.mode === 'navigate') {
+    event.respondWith((async () => {
+      try {
+        const response = await fetch(request);
 
-  // 2) Mismo origen: cache-first con relleno
-  if (url.origin === self.location.origin) {
-    event.respondWith(
-      caches.match(req).then((cached) => {
+        if (response && response.ok) {
+          const cache = await caches.open(APP_CACHE);
+          await cache.put(INDEX_URL, response.clone());
+        }
+
+        return response;
+      } catch (error) {
+        const cached = await caches.match(INDEX_URL);
+
         if (cached) return cached;
-        return fetch(req).then((resp) => {
-          if (resp && resp.status === 200 && resp.type === 'basic') {
-            const clone = resp.clone();
-            caches.open(APP_CACHE).then((c) => c.put(req, clone));
-          }
-          return resp;
-        }).catch(() => cached);
-      })
-    );
+        throw error;
+      }
+    })());
+
     return;
   }
 
-  // 3) Recursos externos (esm.sh, Google Fonts): stale-while-revalidate
+  /* Recursos del mismo sitio */
+  if (
+    url.origin === base.origin &&
+    url.pathname.startsWith(base.pathname)
+  ) {
+    // No guardar respuestas parciales (por ejemplo, Range).
+    if (request.headers.has('range')) return;
+
+    event.respondWith((async () => {
+      const cache = await caches.open(APP_CACHE);
+      const cached = await cache.match(request);
+
+      if (cached) return cached;
+
+      const response = await fetch(request);
+
+      if (
+        response &&
+        response.ok &&
+        response.type === 'basic'
+      ) {
+        await cache.put(request, response.clone());
+      }
+
+      return response;
+    })());
+
+    return;
+  }
+
+  /* Recursos externos: epubjs/esm.sh y Google Fonts.
+     Estrategia stale-while-revalidate. */
+  const updateExternalCache = caches
+    .open(RUNTIME_CACHE)
+    .then(async (cache) => {
+      const response = await fetch(request);
+
+      if (
+        response &&
+        response.ok &&
+        response.type !== 'opaque'
+      ) {
+        try {
+          await cache.put(request, response.clone());
+        } catch (error) {
+          console.warn(
+            '[SW] No se pudo guardar recurso externo:',
+            error
+          );
+        }
+      }
+
+      return response;
+    });
+
+  event.waitUntil(
+    updateExternalCache
+      .then(() => undefined)
+      .catch(() => undefined)
+  );
+
   event.respondWith(
     caches.open(RUNTIME_CACHE).then((cache) =>
-      cache.match(req).then((cached) => {
-        const network = fetch(req)
-          .then((resp) => {
-            if (resp && resp.status === 200) {
-              cache.put(req, resp.clone());
-            }
-            return resp;
-          })
-          .catch(() => cached);
-        return cached || network;
-      })
+      cache.match(request).then(
+        (cached) => cached || updateExternalCache
+      )
     )
   );
 });
 
-/* ---------- Mensajes desde la app (para forzar update) ---------- */
+/* ---------- Mensajes desde la aplicación ---------- */
 self.addEventListener('message', (event) => {
   if (event.data === 'SKIP_WAITING') {
     self.skipWaiting();
